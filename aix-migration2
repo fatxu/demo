@@ -1,0 +1,353 @@
+Great context. Let me analyze your full pipeline first, then optimize each stage.
+
+## Current Pipeline Analysis
+
+```
+[tgz file]
+    │
+    ▼
+extract to /tmp          ← Stage 1: I/O write  (100K files × decompress)
+    │
+    ▼
+encrypt each file        ← Stage 2: CPU + I/O read+write (100K files)
+→ save to /tmp/enc/
+    │
+    ▼
+aws s3 sync /tmp/enc/    ← Stage 3: Network (100K small PUT requests)
+    │
+    ▼
+cleanup /tmp             ← Stage 4: I/O (rm 200K files)
+```
+
+### Bottleneck Map
+
+| Stage | Bottleneck | Cost per tgz |
+|---|---|---|
+| Extract | Disk write 100K files | High inode/metadata overhead |
+| Encrypt each file | CPU + 2× disk R/W per file | **Worst: 200K file ops** |
+| s3 sync | 100K PUT requests, TLS per file | **Worst: latency × 100K** |
+| Cleanup | `rm` on 100K files | Surprisingly slow |
+
+**You are doing ~400K file-level operations per tgz × 5000 tgz = 2 billion file ops total.**
+
+---
+
+## Optimized Pipeline: Stream Everything, Touch Disk Minimally
+
+```
+[tgz file]
+    │
+    ▼ (never extract to disk)
+tar -xzf | per-file encrypt | re-tar | aws s3 cp stream
+    │
+    ▼
+/yyyy/MM/dd/filename.tar.enc  (one object per tgz, or sharded)
+```
+
+### Core Insight
+
+```
+BEFORE:  tgz → 100K files on disk → 100K encrypted files on disk → 100K S3 PUTs
+AFTER:   tgz → pipe → encrypt stream → pipe → 1 S3 PUT (multipart)
+```
+
+You already proved **1 big stream = 100MB/s**. Keep it that way end-to-end.
+
+---
+
+## Option A: Stream tar → encrypt → S3 (Recommended)
+
+### encrypt-stream.ksh (per-file encryption inside tar pipe)
+
+```ksh
+#!/usr/bin/ksh
+# Reads tar stream stdin, encrypts each entry, writes tar stream stdout
+# Uses: ratarmount / tarfile approach via openssl per-entry
+
+# Simpler: encrypt the whole tar stream as one blob (fastest)
+# Use AES-256-CTR - streamable, no padding, no block boundary issues
+
+encrypt_stream() {
+    typeset passphrase_file="$1"
+    openssl enc -aes-256-ctr \
+        -pass file:"$passphrase_file" \
+        -bufsize 131072    # 128KB buffer matches your file sizes
+}
+```
+
+### Main upload script
+
+```ksh
+#!/usr/bin/ksh
+
+SOURCE_DIR="/data/tgz"
+S3_BUCKET="s3://your-bucket"
+KEY_FILE="/secure/enc.key"
+PARALLEL_WORKERS=12        # one per vCPU for CPU-bound encryption
+LOG_DIR="/tmp/upload_logs"
+FAILED="/tmp/failed.txt"
+
+mkdir -p "$LOG_DIR"
+> "$FAILED"
+
+upload_one() {
+    typeset tgzfile="$1"
+    typeset basename="${tgzfile##*/}"          # 20240315_data.tgz
+    typeset datepart="${basename%%_*}"         # 20240315
+    
+    # Parse date → S3 prefix
+    typeset yyyy="${datepart:0:4}"
+    typeset mm="${datepart:4:2}"
+    typeset dd="${datepart:6:2}"
+    typeset s3key="${yyyy}/${mm}/${dd}/${basename%.tgz}.tar.enc"
+    typeset s3path="${S3_BUCKET}/${s3key}"
+    typeset log="${LOG_DIR}/${basename}.log"
+
+    print "START: $basename → $s3key"
+
+    # THE CORE PIPELINE:
+    # 1. decompress tgz → raw tar stream
+    # 2. encrypt entire stream (AES-256-CTR, streamable)
+    # 3. pipe directly into s3 cp multipart upload
+    # Zero files written to disk!
+
+    zcat "$tgzfile" | \
+        openssl enc -aes-256-ctr \
+            -pass file:"$KEY_FILE" \
+            -bufsize 131072 | \
+        aws s3 cp - "$s3path" \
+            --expected-size $((20 * 1024 * 1024 * 1024)) \
+            --no-progress \
+            --storage-class STANDARD \
+            > "$log" 2>&1
+
+    typeset rc=$?
+    if (( rc != 0 )); then
+        print "$tgzfile" >> "$FAILED"
+        print "FAILED: $basename (rc=$rc)"
+    else
+        print "OK: $basename → $s3path"
+    fi
+    return $rc
+}
+
+export KEY_FILE S3_BUCKET LOG_DIR FAILED
+
+# Process all tgz files in parallel
+find "$SOURCE_DIR" -name "*.tgz" -type f | sort | \
+    xargs -P "$PARALLEL_WORKERS" -I {} \
+    ksh -c '
+        tgzfile="{}"
+        basename="${tgzfile##*/}"
+        datepart="${basename%%_*}"
+        yyyy="${datepart:0:4}"
+        mm="${datepart:4:2}"
+        dd="${datepart:6:2}"
+        s3key="${yyyy}/${mm}/${dd}/${basename%.tgz}.tar.enc"
+
+        zcat "$tgzfile" | \
+            openssl enc -aes-256-ctr \
+                -pass file:"'"$KEY_FILE"'" \
+                -bufsize 131072 | \
+            aws s3 cp - "'"$S3_BUCKET"'/${s3key}" \
+                --expected-size $((20 * 1024 * 1024 * 1024)) \
+                --no-progress \
+                > "'"$LOG_DIR"'/${basename}.log" 2>&1
+
+        rc=$?
+        [[ $rc -ne 0 ]] && echo "$tgzfile" >> "'"$FAILED"'"
+        echo "$rc $basename"
+    '
+
+print "\n=== Done ==="
+print "Failed: $(wc -l < $FAILED)"
+```
+
+---
+
+## Option B: If You MUST Have Individual Encrypted Files in S3
+
+When downstream consumers need per-file access (not a blob):
+
+```ksh
+#!/usr/bin/ksh
+# Stream-extract + encrypt + upload per file, NO temp disk writes
+# Uses process substitution and named pipes
+
+upload_tgz_per_file() {
+    typeset tgzfile="$1"
+    typeset basename="${tgzfile##*/}"
+    typeset datepart="${basename%%_*}"
+    typeset yyyy="${datepart:0:4}"
+    typeset mm="${datepart:4:2}"
+    typeset dd="${datepart:6:2}"
+    typeset s3prefix="${S3_BUCKET}/${yyyy}/${mm}/${dd}"
+    typeset FIFO="/tmp/fifo_$$"
+
+    # Extract file list from tgz first (fast, metadata only)
+    # Then stream-extract each file via tar -xOf (stdout, no disk)
+
+    tar -tzf "$tgzfile" | grep -v '/$' | \
+    while read filepath; do
+        typeset fname="${filepath##*/}"
+        typeset s3path="${s3prefix}/${fname}.enc"
+
+        # Extract single file to stdout | encrypt | upload
+        # -xOf: extract, stdout mode, specific file
+        tar -xzOf "$tgzfile" "$filepath" | \
+            openssl enc -aes-256-ctr \
+                -pass file:"$KEY_FILE" | \
+            aws s3 cp - "$s3path" \
+                --expected-size 102400 \
+                --no-progress &
+
+        # Throttle: keep max 200 background jobs
+        while (( $(jobs | wc -l) >= 200 )); do
+            wait -n 2>/dev/null || sleep 0.1
+        done
+    done
+    wait
+}
+```
+
+> ⚠️ Option B is **much slower** for 100K files — still hits the S3 PUT/request problem. Use Option A unless per-file S3 access is a hard requirement.
+
+---
+
+## Option C: Hybrid — Encrypt Per File, Re-tar, Stream Upload
+
+Best of both: individual file encryption (different keys/IV per file) + single S3 object:
+
+```ksh
+#!/usr/bin/ksh
+# tar -xz | encrypt each entry | bundle back into tar | s3 cp
+
+upload_tgz_hybrid() {
+    typeset tgzfile="$1"
+    typeset basename="${tgzfile##*/}"
+    typeset datepart="${basename%%_*}"
+    typeset yyyy="${datepart:0:4}"
+    typeset mm="${datepart:4:2}"
+    typeset dd="${datepart:6:2}"
+    typeset s3path="${S3_BUCKET}/${yyyy}/${mm}/${dd}/${basename%.tgz}.enc.tar"
+    typeset TMPDIR="/tmp/enc_$$"
+
+    # Use RAM-backed tmpfs to avoid disk I/O entirely
+    # Mount: mount -t tmpfs -o size=32G tmpfs /mnt/ramfs
+    typeset RAMDIR="/mnt/ramfs/enc_$$"
+    mkdir -p "$RAMDIR"
+
+    # Extract + encrypt in parallel, write to RAM
+    tar -xzf "$tgzfile" -C "$RAMDIR" \
+        --to-command='
+            fname="$TAR_FILENAME"
+            openssl enc -aes-256-ctr \
+                -pass file:"'"$KEY_FILE"'" \
+                -in /dev/stdin \
+                -out "${fname}.enc"
+        '
+
+    # Re-tar from RAM → stream to S3
+    tar -cf - -C "$RAMDIR" . | \
+        aws s3 cp - "$s3path" \
+            --expected-size $((25 * 1024 * 1024 * 1024)) \
+            --no-progress
+
+    rm -rf "$RAMDIR"
+}
+```
+
+---
+
+## Performance Comparison
+
+```
+Method                          Disk I/O      S3 PUTs    Est. Speed
+──────────────────────────────────────────────────────────────────
+Current (extract→enc→sync)      ~400K ops     100K/tgz   ~5 MB/s  ❌
+Option A (stream blob)          0             1/tgz      ~90 MB/s ✓✓
+Option B (per-file S3 PUTs)     0             100K/tgz   ~15 MB/s ✓
+Option C (RAM + re-tar)         RAM only      1/tgz      ~70 MB/s ✓✓
+```
+
+---
+
+## Additional Optimizations
+
+### Use tmpfs / RAM disk to eliminate disk I/O
+
+```ksh
+# One-time setup (needs root)
+mount -t tmpfs -o size=64G tmpfs /mnt/ramfs
+
+# Verify
+df -h /mnt/ramfs
+```
+
+### Parallel worker tuning for 12 vCPU
+
+```
+zcat    → 1 CPU core per worker (decompression)
+openssl → 1 CPU core per worker (AES-NI hardware accelerated)
+s3 cp   → mostly network/IO wait, low CPU
+
+Optimal workers = 12 (CPU-bound on zcat+openssl)
+Each pipeline: ~80-100 MB/s
+Total: 12 × ~90 MB/s = ~1 GB/s (network permitting)
+```
+
+### Check AES-NI hardware acceleration
+
+```ksh
+# Confirm AES-NI is available (critical for encryption speed)
+grep -m1 aes /proc/cpuinfo
+
+# Benchmark openssl throughput
+openssl speed -evp aes-256-ctr
+
+# Should show ~3-5 GB/s with AES-NI
+# If slow → switch to chacha20 (software-friendly)
+openssl enc -chacha20 ...
+```
+
+### AWS CLI multipart tuning for streaming
+
+```ini
+[default]
+s3 =
+    max_concurrent_requests = 64
+    multipart_threshold     = 64MB
+    multipart_chunksize     = 64MB    # larger chunks = fewer requests
+    max_queue_size          = 1000
+```
+
+### S3 prefix distribution (avoid hot partition)
+
+```ksh
+# /yyyy/MM/dd/ gives you ~365 prefixes/year
+# Each prefix: 5000/365 ≈ 14 tgz objects → no hot partition issue ✓
+# You're fine with date-based prefixing at this scale
+```
+
+---
+
+## Recommended Final Architecture
+
+```
+12 parallel pipelines (one per vCPU):
+
+tgz_file
+  │
+  zcat ──────────────────────────────────── ~500 MB/s decompress
+  │
+  openssl enc -aes-256-ctr (AES-NI) ─────── ~3 GB/s encrypt  
+  │
+  aws s3 cp - s3://bucket/yyyy/MM/dd/x.enc ─ ~100 MB/s upload
+  │
+  (no /tmp, no cleanup needed)
+
+Total throughput target: 12 workers × 90MB/s = ~1 GB/s
+5000 tgz × 10GB avg = 50TB / 1GB/s = ~14 hours
+```
+
+The elimination of 400K file operations per tgz is the single biggest win — everything else is tuning around that.
