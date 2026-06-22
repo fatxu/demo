@@ -1,0 +1,183 @@
+This is a classic **small file problem** — the bottleneck is not bandwidth, it's **request overhead per file**. Here's what's happening:
+
+---
+
+## Why `s3 sync` is Slow for Small Files
+
+```
+Big file (tgz):
+  1 request → multipart upload → saturates pipe → ~100 MB/s ✓
+
+Small files (100KB each):
+  1 file = 1 PUT request
+  100K files/folder = 100K round trips
+  Each round trip: DNS + TCP + TLS + S3 auth + metadata = ~50-200ms latency
+  
+  5 workers × 200 concurrent req = 1000 req/s
+  1000 req/s × 100KB = 100 MB/s theoretical
+  BUT: S3 request rate limits + TLS overhead = ~5 MB/s actual ❌
+```
+
+**The real killers:**
+| Cause | Impact |
+|---|---|
+| Per-file TLS handshake overhead | High CPU, kills throughput |
+| S3 `PUT` rate limit per prefix | Default 3500 PUT/s per prefix |
+| Sequential DNS/TCP per connection | Latency stacks up |
+| `aws s3 sync` lists before uploading | Extra LIST API calls |
+| Small payload = high metadata ratio | 100KB file, 10KB HTTP headers = 10% waste |
+
+---
+
+## Solution 1: Fix the S3 Prefix (Biggest Win)
+
+S3 rate limits are **per prefix**. All files in one folder = one prefix = 3500 PUT/s cap.
+
+```ksh
+# BAD - all 100K files hit same prefix limit:
+# s3://bucket/folder_001/file00001.dat  ← all same prefix
+# s3://bucket/folder_001/file00002.dat
+
+# GOOD - hash-shard the prefix to parallelize across S3 partitions:
+# s3://bucket/ab/folder_001/file00001.dat
+# s3://bucket/cd/folder_001/file00002.dat
+# s3://bucket/ef/folder_001/file00003.dat
+```
+
+```ksh
+#!/usr/bin/ksh
+upload_with_sharding() {
+    typeset src_folder="$1"
+    typeset folder_name="${src_folder##*/}"
+
+    find "$src_folder" -type f | while read filepath; do
+        filename="${filepath##*/}"
+        # Use first 2 chars of md5 as shard prefix
+        shard=$(echo "$filename" | md5sum | cut -c1-2)
+        aws s3 cp "$filepath" \
+            "s3://bucket/${shard}/${folder_name}/${filename}" \
+            --no-progress &
+    done
+    wait
+}
+```
+
+> With 256 hex prefixes, each gets ~14 PUT/s of your 3500/s budget → **~3500 effective PUT/s total**
+
+---
+
+## Solution 2: Tar-on-the-fly Per Folder (Best Throughput)
+
+Since you already proved tgz hits 100 MB/s — **keep doing that per folder**:
+
+```ksh
+#!/usr/bin/ksh
+
+SOURCE_BASE="/data/folders"
+S3_BUCKET="s3://your-bucket/archives"
+PARALLEL_WORKERS=12   # one per vCPU
+
+upload_folder_as_tar() {
+    typeset folder="$1"
+    typeset folder_name="${folder##*/}"
+
+    print "Uploading $folder_name as stream..."
+
+    # Stream tar directly to S3 — no disk write, no temp file
+    tar -czf - -C "$SOURCE_BASE" "$folder_name" | \
+        aws s3 cp - "${S3_BUCKET}/${folder_name}.tgz" \
+            --expected-size $((10 * 1024 * 1024 * 1024)) \
+            --no-progress
+
+    return $?
+}
+
+find "$SOURCE_BASE" -mindepth 1 -maxdepth 1 -type d | \
+    xargs -P "$PARALLEL_WORKERS" -I {} \
+    ksh -c '
+        folder="{}"
+        folder_name="${folder##*/}"
+        tar -czf - -C "'"$SOURCE_BASE"'" "$folder_name" | \
+            aws s3 cp - "'"$S3_BUCKET"'/${folder_name}.tgz" \
+                --expected-size $((10 * 1024 * 1024 * 1024)) \
+                --no-progress
+        echo "$? $folder_name"
+    '
+```
+
+**Why this works:**
+```
+tar czf streams folder → pipe → aws s3 cp reads pipe → multipart upload
+= same code path as your 100MB/s tgz test
+= 12 parallel folder streams × ~80MB/s each (CPU-bound on gzip)
+```
+
+If you don't need compression (already compressed files), use `tar -cf` (no gzip) → even faster:
+
+```ksh
+tar -cf - -C "$SOURCE_BASE" "$folder_name" | \
+    aws s3 cp - "${S3_BUCKET}/${folder_name}.tar" \
+        --expected-size $((10 * 1024 * 1024 * 1024)) \
+        --no-progress
+```
+
+---
+
+## Solution 3: Tune `max_concurrent_requests` Aggressively
+
+If you must use `s3 sync`, the default `10` concurrent requests is the problem:
+
+```ini
+# ~/.aws/config
+[default]
+s3 =
+    max_concurrent_requests = 1000   # was 10 by default!
+    max_queue_size = 100000
+    multipart_threshold = 128MB      # don't multipart small files
+    multipart_chunksize = 128MB
+```
+
+```ksh
+# Also override per-command:
+AWS_MAX_CONCURRENT_REQUESTS=1000 aws s3 sync ./folder s3://bucket/folder/
+```
+
+---
+
+## Solution 4: `aws s3api put-object` with GNU Parallel batching
+
+Skip the Python SDK overhead, go raw:
+
+```ksh
+#!/usr/bin/ksh
+BUCKET="your-bucket"
+FOLDER="/data/folders/folder_001"
+S3_PREFIX="folder_001"
+
+# Feed files to parallel put-object at 500 concurrent
+find "$FOLDER" -type f | \
+    xargs -P 500 -I {} ksh -c '
+        f="{}"
+        key="'"$S3_PREFIX"'/${f##*/}"
+        aws s3api put-object \
+            --bucket "'"$BUCKET"'" \
+            --key "$key" \
+            --body "$f" \
+            --no-cli-pager \
+            >/dev/null 2>&1
+    '
+```
+
+---
+
+## Summary: What to Use
+
+```
+Goal                          Solution
+─────────────────────────────────────────────────────────
+Max throughput, can restore   tar stream per folder → S3   ← BEST
+Must have individual files    Fix prefix sharding + tune max_concurrent_requests=1000
+Must use s3 sync              max_concurrent_requests=1000 + more parallel workers
+```
+
+**Bottom line:** `aws s3 sync` with small files will never match a streaming tar upload because you're paying per-file TCP/TLS/S3-auth overhead 100,000 times per folder. The tar stream amortizes all that cost across one multipart upload.
