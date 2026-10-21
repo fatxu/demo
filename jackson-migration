@@ -1,0 +1,22 @@
+Jackson 3 里不需要再注册 `JavaTimeModule`。`java.time` 的支持已经合并进 `jackson-databind` 本身，`jackson-datatype-jsr310` 这个依赖也可以删掉。同时 `ObjectMapper` 变成不可变的，配置要通过 builder 完成，不能再 `registerModule` 链式调用。
+
+```java
+import tools.jackson.databind.json.JsonMapper;
+import tools.jackson.databind.DeserializationFeature;
+import tools.jackson.databind.SerializationFeature;
+import org.springframework.http.converter.json.JacksonJsonHttpMessageConverter;
+
+JsonMapper jsonMapper = JsonMapper.builder()
+        // java.time 已内置，无需 addModule(new JavaTimeModule())
+        .disable(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES)
+        .build();
+
+JacksonJsonHttpMessageConverter converter = new JacksonJsonHttpMessageConverter(jsonMapper);
+```
+
+几个和 Jackson 2 不同、迁移时容易踩的点：
+
+- **时间序列化默认值**：`WRITE_DATES_AS_TIMESTAMPS` 在 Jackson 3 默认关闭，`LocalDateTime` 等默认输出 ISO-8601 字符串。如果你之前显式 `disable(WRITE_DATES_AS_TIMESTAMPS)`，现在可以省掉；如果之前依赖时间戳输出，需要手动 `enable(SerializationFeature.WRITE_DATES_AS_TIMESTAMPS)`。
+- **包名**：databind 是 `tools.jackson.databind`，但注解（`@JsonFormat`、`@JsonProperty` 等）仍是 `com.fasterxml.jackson.annotation`，不用改。
+- **其他模块**：如果还需要别的模块（比如 Kotlin、Afterburner 类），用 `.addModule(...)` 注册，模块的包名也已迁移到 `tools.jackson.module.*`。
+- **异常**：`JacksonException` 现在是 unchecked，不用再 catch `JsonProcessingException`。
