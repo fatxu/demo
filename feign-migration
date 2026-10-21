@@ -1,0 +1,40 @@
+先说结论：Spring Cloud OpenFeign 5.x（对应 Boot 4 / Framework 7）里，SpringDecoder 不再要求 ObjectFactory<HttpMessageConverters>。从我查到的源码看，它的构造器变成了 接收 ObjectProvider<HttpMessageConverter<?>>，或接收 ObjectProvider<FeignHttpMessageConverters>。Boot 4 里 HttpMessageConverters 也已经换成了 Framework 自带的 org.springframework.http.converter.HttpMessageConverters。SpringEncoder 我没能核对到完整构造器，请以 IDE 为准。 
+github
+
+另外，Boot 4 默认用 Jackson 3（tools.jackson），MappingJackson2HttpMessageConverter 的替代品是 JacksonJsonHttpMessageConverter。
+
+写法
+
+最简单的做法是不再手写匿名 ObjectFactory，而是用 StaticListableBeanFactory 包一个 ObjectProvider：
+
+java
+import org.springframework.beans.factory.ObjectProvider;
+import org.springframework.beans.factory.support.StaticListableBeanFactory;
+import org.springframework.cloud.openfeign.support.ResponseEntityDecoder;
+import org.springframework.cloud.openfeign.support.SpringDecoder;
+import org.springframework.cloud.openfeign.support.SpringEncoder;
+import org.springframework.cloud.openfeign.support.SpringMvcContract;
+import org.springframework.http.converter.HttpMessageConverter;
+import org.springframework.http.converter.json.JacksonJsonHttpMessageConverter;
+
+@SuppressWarnings({"unchecked", "rawtypes"})
+private static ObjectProvider<HttpMessageConverter<?>> converters() {
+    StaticListableBeanFactory bf = new StaticListableBeanFactory();
+    bf.addBean("jacksonConverter", new JacksonJsonHttpMessageConverter());
+    return (ObjectProvider) bf.getBeanProvider(HttpMessageConverter.class);
+}
+
+// 使用
+ObjectProvider<HttpMessageConverter<?>> converters = converters();
+
+CustomFeignBuilder builder = new CustomFeignBuilder(loggerFactory);
+builder.contract(new SpringMvcContract())
+       .decoder(new ResponseEntityDecoder(new SpringDecoder(converters)))
+       .encoder(new SpringEncoder(converters));
+
+如果 SpringEncoder 没有直接接收 ObjectProvider<HttpMessageConverter<?>> 的构造器，只有 ObjectProvider<FeignHttpMessageConverters> 或带 AbstractFormWriter 的版本，处理方式一样：把 FeignHttpMessageConverters 同样放进 StaticListableBeanFactory，再 getBeanProvider(FeignHttpMessageConverters.class)。
+
+几点说明
+自定义 ObjectMapper：Jackson 3 的是 tools.jackson.databind.json.JsonMapper，可以 new JacksonJsonHttpMessageConverter(jsonMapper)。旧的 com.fasterxml.jackson.databind.ObjectMapper 不能直接传进去。
+Jackson 2 兼容：如果你的 DTO 上还有 com.fasterxml.jackson.annotation.* 注解，Jackson 3 的注解包仍是 com.fasterxml.jackson.annotation，不用改；变的是 databind、core 包名。
+如果在 Spring 容器里：直接注入 ObjectProvider<FeignHttpMessageConverters>，或者用 Boot 自动配置好的 feign 默认 Encoder/Decoder bean，就不用手动构造了。
